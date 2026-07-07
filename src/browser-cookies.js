@@ -52,10 +52,29 @@ function robustCopy(src, dst) {
   });
 }
 
-// Copy a (possibly locked) sqlite db to temp and open read-only.
+// The copied cookie DB holds session cookies in plaintext, so keep every copy
+// inside a private (0700) temp dir with a random name, and make sure it is
+// removed even if the process exits abnormally before cleanup() runs.
+const tempDirs = new Set();
+let exitHookInstalled = false;
+function installExitCleanup() {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on('exit', () => {
+    for (const dir of tempDirs) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+}
+
+// Copy a (possibly locked) sqlite db to a private temp dir and open read-only.
 async function openReadonlyCopy(dbPath) {
   const { DatabaseSync } = await loadSqlite();
-  const tmp = path.join(os.tmpdir(), `lc-cookies-${process.pid}-${Date.now()}.sqlite`);
+  installExitCleanup();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-cookies-'));
+  try { fs.chmodSync(dir, 0o700); } catch { /* windows: ignore */ }
+  tempDirs.add(dir);
+  const tmp = path.join(dir, 'Cookies.sqlite');
   robustCopy(dbPath, tmp);
   for (const suffix of ['-wal', '-shm']) {
     const extra = dbPath + suffix;
@@ -66,9 +85,8 @@ async function openReadonlyCopy(dbPath) {
   const db = new DatabaseSync(tmp, { readOnly: true });
   const cleanup = () => {
     try { db.close(); } catch { /* ignore */ }
-    for (const s of ['', '-wal', '-shm']) {
-      try { fs.unlinkSync(tmp + s); } catch { /* ignore */ }
-    }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    tempDirs.delete(dir);
   };
   return { db, cleanup };
 }
@@ -118,6 +136,31 @@ function chromiumRoots() {
     { name: 'Edge', root: path.join(L, 'Microsoft', 'Edge', 'User Data') },
     { name: 'Brave', root: path.join(L, 'BraveSoftware', 'Brave-Browser', 'User Data') },
   ];
+}
+
+// All cookie DBs under a Chromium root: "Default" plus every "Profile N".
+// (A user can be logged into LeetCode under any profile, not just Default.)
+function chromiumCookieDbs(root) {
+  if (!fs.existsSync(root)) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const profiles = entries
+    .filter((e) => e.isDirectory() && (e.name === 'Default' || /^Profile \d+$/.test(e.name)))
+    .map((e) => e.name)
+    // Default first, then Profile 1, 2, ... in numeric order.
+    .sort((a, b) =>
+      a === 'Default' ? -1 : b === 'Default' ? 1 : a.localeCompare(b, undefined, { numeric: true })
+    );
+  const dbs = [];
+  for (const prof of profiles) {
+    const db = path.join(root, prof, 'Network', 'Cookies');
+    if (fs.existsSync(db)) dbs.push(db);
+  }
+  return dbs;
 }
 
 // Read the Windows clipboard as text (for `lc login --clip`).
@@ -237,107 +280,30 @@ function isLockError(e) {
   );
 }
 
-async function fromChromium() {
-  let sawAppBound = false;
-  const locked = [];
-  for (const { name, root } of chromiumRoots()) {
-    const cookiesDb = path.join(root, 'Default', 'Network', 'Cookies');
-    if (!fs.existsSync(cookiesDb)) continue;
-    let handle;
-    let key;
-    try {
-      key = chromiumKey(root);
-    } catch {
-      continue; // can't get key for this browser
-    }
-    try {
-      handle = await openReadonlyCopy(cookiesDb);
-      const rows = handle.db
-        .prepare(
-          `SELECT name, encrypted_value FROM cookies
-           WHERE host_key LIKE '%leetcode.com' AND name IN (?, ?)`
-        )
-        .all(...WANTED);
-      const out = {};
-      for (const r of rows) {
-        try {
-          out[r.name] = decryptChromiumValue(Buffer.from(r.encrypted_value), key);
-        } catch (e) {
-          if (e.appBound) sawAppBound = true;
-        }
-      }
-      if (out.LEETCODE_SESSION) return { source: name, cookies: out };
-    } catch (e) {
-      if (isLockError(e)) locked.push(name);
-      /* try next browser */
-    } finally {
-      handle?.cleanup();
-    }
-  }
-  if (sawAppBound) {
-    const err = new Error(
-      'Your Chrome/Edge uses app-bound cookie encryption (v20), which cannot be read at the user level. ' +
-        'Use Firefox for auto-login, or fall back to manual: lc login'
-    );
-    err.appBound = true;
-    throw err;
-  }
-  if (locked.length) {
-    const err = new Error(
-      `${locked.join(' and ')} ${locked.length > 1 ? 'are' : 'is'} running and lock the cookie database. ` +
-        `Fully close ${locked.join('/')} (check the system tray) and retry, or use: lc login --manual`
-    );
-    err.locked = true;
-    throw err;
-  }
-  return null;
+function lockedError(name) {
+  const err = new Error(
+    `${name} is running and locks the cookie database. ` +
+      `Fully close ${name} (check the system tray) and retry, or use: lc login --manual`
+  );
+  err.locked = true;
+  err.browser = name;
+  return err;
 }
 
-// Try browsers in order; return { source, cookies } or null.
-// `preferred` (optional): 'firefox' | 'chrome' | 'edge' | 'brave' to force one.
-export async function getLeetcodeCookies(preferred) {
-  if (process.platform !== 'win32') {
-    throw new Error('Browser auto-login currently supports Windows only. Use: lc login');
-  }
-  const p = (preferred || '').toLowerCase();
-  const tryers = [];
-  if (p === 'firefox') tryers.push(fromFirefox);
-  else if (p && p !== 'firefox') tryers.push(() => fromChromiumOnly(p));
-  else tryers.push(fromFirefox, fromChromium);
-
-  let firstErr;
-  for (const fn of tryers) {
-    try {
-      const res = await fn();
-      if (res?.cookies?.LEETCODE_SESSION) return res;
-    } catch (e) {
-      firstErr = firstErr || e;
-    }
-  }
-  if (firstErr) throw firstErr;
-  return null;
+function appBoundError(name) {
+  const err = new Error(
+    `${name} uses app-bound cookie encryption (v20), which can't be read at the user level. ` +
+      `Log in to leetcode.com in Firefox for auto-login, or use: lc login --manual`
+  );
+  err.appBound = true;
+  err.browser = name;
+  return err;
 }
 
-async function fromChromiumOnly(name) {
-  const target = chromiumRoots().find((b) => b.name.toLowerCase() === name);
-  if (!target) return null;
-  const cookiesDb = path.join(target.root, 'Default', 'Network', 'Cookies');
-  if (!fs.existsSync(cookiesDb)) return null;
-  const key = chromiumKey(target.root);
-  let handle;
-  try {
-    handle = await openReadonlyCopy(cookiesDb);
-  } catch (e) {
-    if (isLockError(e)) {
-      const err = new Error(
-        `${target.name} is running and locks the cookie database. ` +
-          `Fully close ${target.name} (check the system tray) and retry, or use: lc login --manual`
-      );
-      err.locked = true;
-      throw err;
-    }
-    throw e;
-  }
+// Read + decrypt the wanted cookies from a single Chromium cookie DB.
+// Returns { cookies, sawAppBound }. Throws lock errors up to the caller.
+async function readChromiumCookieDb(cookiesDb, key) {
+  const handle = await openReadonlyCopy(cookiesDb);
   try {
     const rows = handle.db
       .prepare(
@@ -355,17 +321,97 @@ async function fromChromiumOnly(name) {
         else throw e;
       }
     }
-    if (out.LEETCODE_SESSION) return { source: target.name, cookies: out };
-    if (sawAppBound) {
-      const err = new Error(
-        `${target.name} uses app-bound cookie encryption (v20), which can't be read at the user level. ` +
-          `Log in to leetcode.com in Firefox for auto-login, or use: lc login --manual`
-      );
-      err.appBound = true;
-      throw err;
-    }
-    return null;
+    return { cookies: out, sawAppBound };
   } finally {
     handle.cleanup();
   }
+}
+
+// Read cookies from one Chromium browser, scanning every profile.
+// Returns { source, cookies } | null. Throws a tagged error (.locked /
+// .appBound) when that's the reason no cookies could be read.
+async function readChromiumBrowser(name, root) {
+  let key;
+  try {
+    key = chromiumKey(root);
+  } catch {
+    return null; // can't get the decryption key for this browser
+  }
+  let sawAppBound = false;
+  for (const cookiesDb of chromiumCookieDbs(root)) {
+    let res;
+    try {
+      res = await readChromiumCookieDb(cookiesDb, key);
+    } catch (e) {
+      if (isLockError(e)) throw lockedError(name);
+      throw e;
+    }
+    if (res.sawAppBound) sawAppBound = true;
+    if (res.cookies.LEETCODE_SESSION) return { source: name, cookies: res.cookies };
+  }
+  if (sawAppBound) throw appBoundError(name);
+  return null;
+}
+
+async function fromChromium() {
+  let appBoundErr;
+  const locked = [];
+  for (const { name, root } of chromiumRoots()) {
+    try {
+      const res = await readChromiumBrowser(name, root);
+      if (res?.cookies?.LEETCODE_SESSION) return res;
+    } catch (e) {
+      if (e.locked) locked.push(name);
+      else if (e.appBound) appBoundErr = appBoundErr || e;
+      // otherwise: skip this browser, try the next
+    }
+  }
+  if (locked.length) {
+    const err = new Error(
+      `${locked.join(' and ')} ${locked.length > 1 ? 'are' : 'is'} running and lock the cookie database. ` +
+        `Fully close ${locked.join('/')} (check the system tray) and retry, or use: lc login --manual`
+    );
+    err.locked = true;
+    throw err;
+  }
+  if (appBoundErr) throw appBoundErr;
+  return null;
+}
+
+async function fromChromiumOnly(name) {
+  const target = chromiumRoots().find((b) => b.name.toLowerCase() === name);
+  if (!target) return null;
+  return readChromiumBrowser(target.name, target.root);
+}
+
+// Try browsers in order; return { source, cookies } or null.
+// `preferred` (optional): 'firefox' | 'chrome' | 'edge' | 'brave' to force one.
+export async function getLeetcodeCookies(preferred) {
+  if (process.platform !== 'win32') {
+    throw new Error('Browser auto-login currently supports Windows only. Use: lc login');
+  }
+  const p = (preferred || '').toLowerCase();
+  const tryers = [];
+  if (p === 'firefox') tryers.push(fromFirefox);
+  else if (p && p !== 'firefox') tryers.push(() => fromChromiumOnly(p));
+  else tryers.push(fromFirefox, fromChromium);
+
+  const errors = [];
+  for (const fn of tryers) {
+    try {
+      const res = await fn();
+      if (res?.cookies?.LEETCODE_SESSION) return res;
+    } catch (e) {
+      errors.push(e);
+    }
+  }
+  if (errors.length) {
+    // Surface the most actionable error first: a locked browser (the user can
+    // close it, or re-run with --close-browser) or an app-bound explanation
+    // beats a generic "not found" from another browser.
+    const best =
+      errors.find((e) => e.locked) || errors.find((e) => e.appBound) || errors[0];
+    throw best;
+  }
+  return null;
 }
