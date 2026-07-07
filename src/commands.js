@@ -4,6 +4,16 @@ import readline from 'node:readline/promises';
 import * as api from './api.js';
 import { getConfig, saveConfig, getMeta, saveMeta, SOLUTIONS_DIR } from './config.js';
 import { c, diffColor, htmlToText, hr, block } from './render.js';
+import {
+  getLeetcodeCookies,
+  runningChromiumBrowsers,
+  closeBrowser,
+  readClipboard,
+  parseLeetcodeCookies,
+} from './browser-cookies.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 
 const LANG_BY_EXT = { '.js': 'javascript', '.ts': 'typescript' };
 const EXT_BY_LANG = { javascript: '.js', typescript: '.ts' };
@@ -57,11 +67,29 @@ function requireAuth() {
 
 // ---------- commands ----------
 
-export async function login(flags) {
-  let { session, csrf } = flags;
+async function finishLogin(session, csrf) {
+  saveConfig({ LEETCODE_SESSION: session, csrftoken: csrf });
+  const u = await api.whoami();
+  if (u?.isSignedIn) {
+    console.log(c.green(`✓ Logged in as ${c.bold(u.username)}. Cookies saved to .lc/config.json`));
+    return true;
+  }
+  console.log(c.yellow('Cookies saved, but LeetCode reports you are not signed in — the session may be stale.'));
+  return false;
+}
+
+async function manualLogin(flags) {
+  let session = flags.session;
+  let csrf = flags.csrf;
   if (!session || !csrf) {
+    if (!process.stdin.isTTY) {
+      throw new Error(
+        'Could not read cookies automatically and no interactive terminal to paste into.\n' +
+          'Run `lc login` in a real terminal, or pass --session <val> --csrf <val>.'
+      );
+    }
     console.log(`
-${c.bold('How to get your LeetCode cookies:')}
+${c.bold('Paste your LeetCode cookies:')}
   1. Log in to ${c.cyan('https://leetcode.com')} in your browser.
   2. Open DevTools (F12) -> Application -> Cookies -> https://leetcode.com
   3. Copy the values of ${c.cyan('LEETCODE_SESSION')} and ${c.cyan('csrftoken')}.
@@ -72,13 +100,86 @@ ${c.bold('How to get your LeetCode cookies:')}
     rl.close();
   }
   if (!session || !csrf) throw new Error('Both values are required.');
-  saveConfig({ LEETCODE_SESSION: session, csrftoken: csrf });
-  const u = await api.whoami();
-  if (u?.isSignedIn) {
-    console.log(c.green(`✓ Logged in as ${c.bold(u.username)}. Cookies saved to .lc/config.json`));
-  } else {
-    console.log(c.yellow('Cookies saved, but LeetCode reports you are not signed in — double-check the values.'));
+  await finishLogin(session, csrf);
+}
+
+async function clipLogin() {
+  console.log(c.dim('Reading cookies from your clipboard...'));
+  const { LEETCODE_SESSION, csrftoken } = parseLeetcodeCookies(readClipboard());
+  if (!LEETCODE_SESSION || !csrftoken) {
+    const missing = [!LEETCODE_SESSION && 'LEETCODE_SESSION', !csrftoken && 'csrftoken']
+      .filter(Boolean)
+      .join(' and ');
+    console.log(c.yellow(`Couldn't find ${missing} in the clipboard.`));
+    console.log(`
+${c.bold('Copy your cookies first, then re-run')} ${c.cyan('lc login --clip')}${c.bold(':')}
+  1. On ${c.cyan('leetcode.com')}, open DevTools (F12) -> ${c.cyan('Network')} tab (reload if empty).
+  2. Click any request to leetcode.com -> ${c.cyan('Headers')} -> Request Headers.
+  3. Right-click the ${c.cyan('Cookie')} header -> Copy value. It holds both cookies.
+
+Or paste them by hand: ${c.cyan('lc login --manual')}`);
+    return;
   }
+  console.log(c.green('✓ Found both cookies in the clipboard.'));
+  await finishLogin(LEETCODE_SESSION, csrftoken);
+}
+
+export async function login(flags) {
+  // Explicit values passed -> straight to manual path.
+  if (flags.session && flags.csrf) return manualLogin(flags);
+  // Read the two cookies from whatever is on the clipboard.
+  if (flags.clip) return clipLogin();
+  // User explicitly wants to paste.
+  if (flags.manual) return manualLogin(flags);
+
+  // Default: read cookies straight from the browser. --browser <name> forces one.
+  const preferred = typeof flags.browser === 'string' ? flags.browser : undefined;
+  const wantClose = flags['close-browser'];
+  console.log(c.dim(preferred ? `Reading LeetCode cookies from ${preferred}...` : 'Reading LeetCode cookies from your browser...'));
+  let found;
+  try {
+    found = await getLeetcodeCookies(preferred);
+  } catch (e) {
+    // If a Chromium browser is locking its cookie DB and --close-browser was
+    // passed, close it (tabs restore on relaunch) and retry once.
+    if (e.locked && wantClose) {
+      const targets =
+        preferred && preferred.toLowerCase() !== 'firefox'
+          ? [cap(preferred)]
+          : runningChromiumBrowsers();
+      if (targets.length) {
+        console.log(c.yellow(`Closing ${targets.join(', ')} to read cookies — your tabs will be restored on relaunch...`));
+        for (const t of targets) closeBrowser(t);
+        await sleep(2500);
+        try {
+          found = await getLeetcodeCookies(preferred);
+        } catch (e2) {
+          console.log(c.yellow(`Browser read still failed: ${e2.message}`));
+          return manualLogin(flags);
+        }
+      } else {
+        console.log(c.yellow(`Browser read failed: ${e.message}`));
+        return manualLogin(flags);
+      }
+    } else {
+      console.log(c.yellow(`Browser read failed: ${e.message}`));
+      if (e.locked) console.log(c.dim('Tip: re-run with --close-browser to close it automatically.'));
+      console.log(c.dim('Falling back to manual paste. (Use `lc login --manual` to skip straight here.)'));
+      return manualLogin(flags);
+    }
+  }
+  if (!found?.cookies?.LEETCODE_SESSION) {
+    console.log(c.yellow('No LeetCode session cookie found in your browser(s).'));
+    console.log(c.dim('Make sure you are logged in to leetcode.com, then retry — or paste manually below.'));
+    return manualLogin(flags);
+  }
+  const { source, cookies } = found;
+  if (!cookies.csrftoken) {
+    console.log(c.yellow(`Found LEETCODE_SESSION in ${source} but no csrftoken — paste it manually below.`));
+    return manualLogin({ ...flags, session: cookies.LEETCODE_SESSION });
+  }
+  console.log(c.green(`✓ Read cookies from ${c.bold(source)}.`));
+  await finishLogin(cookies.LEETCODE_SESSION, cookies.csrftoken);
 }
 
 export async function whoami() {

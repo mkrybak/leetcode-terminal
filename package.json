@@ -1,5 +1,5 @@
 {
-  "name": "terminal-leetcode",
+  "name": "leetcode-terminal",
   "version": "1.0.0",
   "description": "Silent LeetCode training from the terminal: show problems, run code, submit, inspect failures.",
   "type": "module",

@@ -7,7 +7,11 @@ const HELP = `
 ${c.bold('lc')} — LeetCode from your terminal
 
 ${c.bold('Setup')}
-  lc login                      save your LeetCode session cookies
+  lc login                      auto-read cookies from your browser (Chrome/Edge/Firefox)
+     [--clip]                   grab both cookies from your clipboard (copy the Cookie header)
+     [--browser firefox|chrome|edge]   force a specific browser
+     [--close-browser]          auto-close Chrome/Edge if it's locking its cookies
+     [--manual]                 paste cookies by hand instead
   lc whoami                     verify authentication
 
 ${c.bold('Problems')}

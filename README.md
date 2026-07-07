@@ -1,4 +1,4 @@
-# terminal-leetcode
+# leetcode-terminal
 
 Train LeetCode silently from any terminal. Real problems, real judge, real submissions — no browser tab needed.
 
@@ -7,7 +7,7 @@ Requires Node 18+. No dependencies.
 ## Install
 
 ```
-cd terminal-leetcode
+cd leetcode-terminal
 npm link
 ```
 
@@ -15,16 +15,55 @@ This gives you a global `lc` command. (Alternative: `node bin/lc.js <command>`.)
 
 ## Login (one time)
 
-LeetCode has no API tokens, so auth uses your browser session:
+LeetCode has no API tokens, so auth uses your browser session. Log in to
+https://leetcode.com in your browser first. Then pick whichever route fits your
+browser:
 
-1. Log in to https://leetcode.com in your browser.
-2. DevTools (F12) → Application → Cookies → `https://leetcode.com`
-3. Copy `LEETCODE_SESSION` and `csrftoken`.
-4. Run `lc login` and paste them (or `lc login --session <val> --csrf <val>`).
+### Fastest for Chrome / Edge: clipboard
 
-Cookies are stored in `.lc/config.json` (gitignored). Sessions last weeks; when it expires, run `lc login` again.
+Recent Chrome/Edge (v127+) use *app-bound encryption*, which no user-level tool
+can decrypt. The quickest path there:
 
-Verify: `lc whoami`
+1. On leetcode.com, open DevTools (F12) → **Network** tab (reload if it's empty).
+2. Click any request to `leetcode.com` → **Headers** → **Request Headers**.
+3. Right-click the **Cookie** header → **Copy value** (it contains both cookies).
+4. Run:
+
+```
+lc login --clip
+```
+
+It reads your clipboard and extracts `LEETCODE_SESSION` + `csrftoken` automatically.
+
+### Fully automatic: Firefox
+
+If you're logged into leetcode in **Firefox**, just run:
+
+```
+lc login
+```
+
+Firefox stores cookies unencrypted and doesn't lock them, so this reads them
+directly — no DevTools, works even while Firefox is open. (`lc login` also tries
+Chrome/Edge, decrypting their DPAPI + AES-256-GCM cookies when possible; for those
+you must fully close the browser first, and it still can't beat v20 app-bound
+encryption — use `--clip` instead.)
+
+Options: `lc login --browser firefox|chrome|edge` forces one; `--close-browser`
+auto-closes a locked Chrome/Edge (tabs restore on relaunch).
+
+### Manual fallback
+
+```
+lc login --manual        # prompts for the two cookie values
+# or non-interactively:
+lc login --session <LEETCODE_SESSION> --csrf <csrftoken>
+```
+
+Grab the values from DevTools → Application → Cookies → `https://leetcode.com`.
+
+Cookies are stored in `.lc/config.json` (gitignored). Sessions last weeks; when it
+expires, log in again. Verify anytime with `lc whoami`.
 
 ## Workflow
 
